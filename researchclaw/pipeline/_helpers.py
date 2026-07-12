@@ -231,70 +231,124 @@ def _build_fallback_queries(topic: str) -> list[str]:
     """Extract meaningful search queries from a long topic string.
 
     Instead of using the raw topic as a query (which is often 200+ chars
-    and returns garbage from search engines), extract noun phrases and
-    domain keywords. Returns 5-10 targeted queries.
+    and returns garbage from search engines), extract key technical phrases
+    and combine them into targeted academic search queries.
+    Returns 8-15 targeted queries.
     """
-    # Split on common delimiters and extract meaningful chunks
-    chunks = re.split(r"[,:;()\[\]]+", topic)
-    chunks = [c.strip() for c in chunks if len(c.strip()) > 8]
-    cleaned_chunks = []
-    for c in chunks:
-        c = re.sub(
-            r"^(and|or|the|a|an|in|of|for|with|across|multiple|three|various)\s+",
-            "", c, flags=re.IGNORECASE,
-        )
-        c = c.strip()
-        if len(c) > 8:
-            cleaned_chunks.append(c)
-    chunks = cleaned_chunks
+    topic_lower = topic.lower()
 
-    # Extract key terms (words that look like domain terms, not stopwords)
-    _stop = {
+    # --- Step 1: Extract multi-word technical phrases ---
+    # Common ML/AI multi-word terms to look for
+    _known_phrases = [
+        "spectral normalization", "lipschitz control", "lipschitz constant",
+        "weight decay", "l2 regularization", "l1 regularization",
+        "sharpness aware minimization", "gradient descent", "stochastic gradient",
+        "batch normalization", "layer normalization", "dropout",
+        "data augmentation", "cross validation", "cross-validation",
+        "neural network", "deep learning", "machine learning",
+        "tabular data", "small data", "small sample", "few shot",
+        "generalization stability", "generalization bound", "generalization error",
+        "flat minima", "sharp minima", "hessian", "loss landscape",
+        "optimization", "convergence rate", "robustness",
+        "transfer learning", "fine tuning", "pre training",
+        "ensemble learning", "model selection", "hyperparameter",
+        "convolutional neural", "recurrent neural", "transformer",
+        "support vector", "random forest", "gradient boosting",
+        "supervised learning", "unsupervised learning", "semi-supervised",
+        "classification", "regression", "overfitting", "underfitting",
+    ]
+
+    found_phrases: list[str] = []
+    topic_remaining = topic_lower
+    for phrase in _known_phrases:
+        if phrase in topic_remaining:
+            found_phrases.append(phrase)
+            # Remove found phrase to avoid double-counting sub-phrases
+            topic_remaining = topic_remaining.replace(phrase, " ", 1)
+
+    # Also extract quoted or parenthesized text as potential key phrases
+    for pattern in [r'"([^"]+)"', r"'([^']+)'", r"\(([^)]+)\)"]:
+        for match in re.findall(pattern, topic):
+            phrase = match.strip().lower()
+            if len(phrase) > 4 and phrase not in found_phrases:
+                found_phrases.append(phrase)
+
+    # --- Step 2: Extract single key terms (nouns/adjectives, >=4 chars) ---
+    _stop_terms = {
         "the", "and", "for", "with", "from", "that", "this", "into",
-        "over", "across", "multiple", "three", "result", "comprehensive",
-        "using", "based", "between", "various", "different", "several",
+        "over", "across", "multiple", "three", "various", "different",
+        "several", "between", "result", "comprehensive", "using", "based",
         "parameter", "parameters", "analysis", "approach", "method",
-        "framework", "frameworks",
+        "framework", "frameworks", "comparing", "against", "study",
+        "investigation", "empirical", "towards", "toward", "novel",
+        "challenge", "challenges", "gaps", "gap", "critical", "survey",
+        "review", "their", "have", "been", "more", "than", "which",
+        "about", "also", "some", "other", "each", "these", "those",
     }
-    words = topic.lower().split()
-    key_terms = [w for w in words if len(w) > 3 and w not in _stop]
+    words = topic_lower.split()
+    key_terms: list[str] = []
+    for w in words:
+        w_clean = w.strip(".,;:!?()[]\"'")
+        if len(w_clean) >= 4 and w_clean not in _stop_terms and w_clean.isalpha():
+            # Only add if it's not already part of a found phrase
+            if not any(w_clean in p for p in found_phrases):
+                key_terms.append(w_clean)
 
+    # --- Step 3: Build queries by combining phrases + terms ---
     queries: list[str] = []
 
-    # Strategy 1: Use meaningful chunks (up to 60 chars each)
-    for chunk in chunks[:4]:
-        if len(chunk) > 60:
-            chunk = " ".join(chunk.split()[:6])
-        if chunk and chunk not in queries:
-            queries.append(chunk)
+    # 3a: Each multi-word phrase is a good query on its own
+    for phrase in found_phrases[:8]:
+        if len(phrase) >= 6:
+            queries.append(phrase)
 
-    # Strategy 2: Bigrams of key terms
-    clean_terms = [t for t in key_terms if re.match(r"^[a-z]", t) and ":" not in t]
-    for i in range(min(len(clean_terms) - 1, 4)):
-        bigram = f"{clean_terms[i]} {clean_terms[i + 1]}"
-        if bigram not in queries:
-            queries.append(bigram)
+    # 3b: Combine 2 best phrases together for focused queries
+    for i in range(min(len(found_phrases), 5)):
+        for j in range(i + 1, min(len(found_phrases), 5)):
+            combined = f"{found_phrases[i]} {found_phrases[j]}"
+            if len(combined) <= 60:
+                queries.append(combined)
 
-    # Deduplicate preserving order
+    # 3c: Top phrase + top key terms for broader queries
+    for phrase in found_phrases[:3]:
+        for term in key_terms[:4]:
+            q = f"{phrase} {term}"
+            if q not in queries and len(q) <= 60:
+                queries.append(q)
+
+    # 3d: Key term combinations (3-4 terms together)
+    if len(key_terms) >= 3:
+        for i in range(min(len(key_terms) - 2, 4)):
+            q = " ".join(key_terms[i : i + 3])
+            if q not in queries:
+                queries.append(q)
+
+    # 3e: Add survey/benchmark variants using top phrases
+    for phrase in found_phrases[:2]:
+        for suffix in ("survey", "review", "benchmark", "comparison"):
+            q = f"{phrase} {suffix}"
+            if q not in queries:
+                queries.append(q)
+
+    # --- Step 4: Deduplicate, filter, and return ---
     seen: set[str] = set()
     unique: list[str] = []
     for q in queries:
-        q_lower = q.strip().lower()
-        if q_lower and q_lower not in seen:
-            seen.add(q_lower)
-            unique.append(q.strip())
+        q_clean = " ".join(q.strip().lower().split())
+        # Filter: must have >=8 chars and at least 2 words
+        if q_clean and q_clean not in seen and len(q_clean) >= 8 and " " in q_clean:
+            seen.add(q_clean)
+            unique.append(q_clean)
 
-    # Ensure we have at least a few useful queries
-    topic_short = topic[:60].strip()
-    for suffix in ("survey", "review", "benchmark", "state of the art", "recent advances"):
-        if len(unique) >= 5:
-            break
-        candidate = f"{topic_short} {suffix}".strip()
-        if candidate.lower() not in seen:
-            seen.add(candidate.lower())
-            unique.append(candidate)
+    # Last resort: if we have too few queries, generate generic ones
+    if len(unique) < 5 and key_terms:
+        for i in range(min(len(key_terms) - 1, 8)):
+            q = f"{key_terms[i]} {key_terms[i + 1] if i + 1 < len(key_terms) else key_terms[0]}"
+            if q not in seen:
+                seen.add(q)
+                unique.append(q)
 
-    return unique[:10]
+    return unique[:15]
 
 
 # ---------------------------------------------------------------------------
