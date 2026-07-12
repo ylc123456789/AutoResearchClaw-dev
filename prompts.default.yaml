@@ -144,7 +144,7 @@ stages:
       {revised}'
   knowledge_extract:
     json_mode: true
-    max_tokens: 32768
+    max_tokens: 65536
     system: You extract high-signal evidence cards from papers.
     user: 'Extract structured knowledge cards from shortlist.
 
@@ -171,30 +171,34 @@ stages:
       {plan_text}'
   literature_screen:
     json_mode: true
-    max_tokens: 16384
-    system: You are a strict domain-aware reviewer. Score each candidate paper on relevance (0-1) and quality (0-1), then return
-      only the papers that pass the threshold. Reject off-topic papers aggressively — a paper about a different domain is
-      worthless regardless of citation count.
+    max_tokens: 65536
+    system: You screen academic papers for relevance to a research topic. Be inclusive — papers about related
+      methods, theory, or application domains are valuable even if they don't exactly match the topic.
+      A paper about "spectral normalization for CNNs" is relevant to "spectral normalization on tabular data"
+      because it covers the core technique. Similarly, a paper about "regularization theory" or "small-data
+      generalization" provides useful context. Only reject papers from completely unrelated fields (biology,
+      medicine, materials science, astrophysics, etc.).
     user: |-
-      Screen these candidate papers for relevance to the research topic.
+      Score each candidate paper and return a shortlist of papers relevant to the research topic.
 
       TOPIC: {topic}
       DOMAINS: {domains}
-      THRESHOLD: {quality_threshold}
 
-      For each paper, evaluate:
-      - relevance_score (0-1): how closely does this paper relate to the topic?
-      - quality_score (0-1): is this a well-conducted study from a reputable venue?
-      - keep_reason: one sentence explaining why this paper is relevant (or why not)
+      SCORING RULES:
+      - relevance_score (0-1): Does this paper relate to ANY key concept in the topic?
+        Give >=0.4 if the paper covers: regularization methods, spectral/Lipschitz normalization,
+        weight decay, generalization theory, flat/sharp minima, loss landscapes, small-data
+        training, tabular data ML, or neural network stability.
+        Give >=0.6 if it covers 2+ of these concepts.
+      - quality_score (0-1): Is this from a reputable venue with sound methodology?
+      - keep_reason: one sentence on why this paper relates to the topic
 
-      ONLY keep papers with relevance_score >= 0.5 AND quality_score >= 0.4.
-      Reject papers about completely unrelated domains (biology, physics, materials science, etc.)
-      even if they are highly cited.
+      Keep papers with relevance_score >= 0.4.
+      Reject ONLY papers from entirely different fields (biology, medicine, astrophysics, etc.).
 
-      Return a JSON object with a "shortlist" array. Preserve these original fields
-      from each candidate: paper_id, title, cite_key, year, abstract, venue, citation_count,
-      doi, arxiv_id, url, source. Do NOT include the full authors list.
-
+      Return JSON: {{"shortlist": [...]}} with these fields from each paper:
+      paper_id, title, cite_key, year, abstract, venue, citation_count, doi, arxiv_id, url, source,
+      relevance_score, quality_score, keep_reason.
       Return ONLY valid JSON — no markdown fences, no extra text.
 
       Candidates:

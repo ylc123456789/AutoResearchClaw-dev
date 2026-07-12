@@ -100,20 +100,14 @@ class LLMClient:
 
     @staticmethod
     def _normalize_wire_api(wire_api: str) -> str:
-        normalized = (wire_api or "").strip().lower().replace("-", "_")
-        if normalized in ("", "chat/completions", "chat_completions"):
-            return "chat_completions"
-        if normalized == "responses":
-            return "responses"
-        return normalized
-
-    def _endpoint_path(self) -> str:
-        if self._normalize_wire_api(self.config.wire_api) == "responses":
-            return "/responses"
-        return "/chat/completions"
+        return wire_api.strip().lower()
 
     def _endpoint_url(self, base_url: str) -> str:
-        return f"{base_url.rstrip('/')}{self._endpoint_path()}"
+        wire_api = self._normalize_wire_api(self.config.wire_api)
+        base = base_url.rstrip("/")
+        if wire_api == "responses":
+            return f"{base}/responses"
+        return f"{base}/chat/completions"
 
     @staticmethod
     def _supports_temperature(model: str) -> bool:
@@ -121,106 +115,87 @@ class LLMClient:
 
     @classmethod
     def from_rc_config(cls, rc_config: Any) -> LLMClient:
-        from researchclaw.llm import PROVIDER_PRESETS
+        """Build LLMClient from a ResearchClaw RCConfig object."""
+        from researchclaw.config import RCConfig
 
-        provider = getattr(rc_config.llm, "provider", "openai")
-        preset = PROVIDER_PRESETS.get(provider, {})
-        preset_base_url = preset.get("base_url")
+        if not isinstance(rc_config, RCConfig):
+            raise TypeError(f"Expected RCConfig, got {type(rc_config)}")
 
-        api_key = str(
-            rc_config.llm.api_key or os.environ.get(rc_config.llm.api_key_env, "") or ""
-        )
+        llm_cfg = rc_config.llm
+        api_key = llm_cfg.api_key or os.environ.get(llm_cfg.api_key_env, "")
 
-        # Use preset base_url if available and config doesn't override
-        base_url = rc_config.llm.base_url or preset_base_url or ""
+        # Detect Anthropic provider and use adapter
+        provider = llm_cfg.provider.lower()
+        if provider == "anthropic":
+            from researchclaw.llm.anthropic_adapter import AnthropicAdapter
 
-        # Preserve original URL/key before MetaClaw bridge override
-        # (needed for Anthropic adapter which should always talk directly
-        # to the Anthropic API, not through the OpenAI-compatible proxy).
-        original_base_url = base_url
-        original_api_key = api_key
+            client = cls(config=LLMConfig(
+                base_url="",
+                api_key=api_key,
+                primary_model=llm_cfg.primary_model,
+                fallback_models=list(llm_cfg.fallback_models),
+                max_tokens=4096,
+                temperature=0.7,
+                max_retries=3,
+                timeout_sec=300,
+            ))
+            client._anthropic = AnthropicAdapter(api_key=api_key)
+            return client
 
-        # MetaClaw bridge: if enabled, point to proxy and set up fallback
-        bridge = getattr(rc_config, "metaclaw_bridge", None)
-        fallback_url = ""
-        fallback_api_key = ""
-
-        if bridge and getattr(bridge, "enabled", False):
-            fallback_url = base_url
-            fallback_api_key = api_key
-            base_url = bridge.proxy_url
-            if bridge.fallback_url:
-                fallback_url = bridge.fallback_url
-            if bridge.fallback_api_key:
-                fallback_api_key = bridge.fallback_api_key
-
-        config = LLMConfig(
-            base_url=base_url,
+        return cls(config=LLMConfig(
+            base_url=llm_cfg.base_url,
             api_key=api_key,
-            wire_api=getattr(rc_config.llm, "wire_api", "chat_completions"),
-            primary_model=rc_config.llm.primary_model or "gpt-4o",
-            fallback_models=list(rc_config.llm.fallback_models or []),
-            fallback_url=fallback_url,
-            fallback_api_key=fallback_api_key,
-            timeout_sec=getattr(rc_config.llm, "timeout_sec", 600),
-        )
-        client = cls(config)
-
-        # Detect Anthropic or Kimi-Anthropic provider — use original URL/key (not the
-        # MetaClaw proxy URL which is OpenAI-compatible only).
-        if provider in ("anthropic", "kimi-anthropic"):
-            from .anthropic_adapter import AnthropicAdapter
-
-            client._anthropic = AnthropicAdapter(
-                original_base_url, original_api_key, config.timeout_sec
-            )
-        return client
+            wire_api=llm_cfg.wire_api,
+            primary_model=llm_cfg.primary_model,
+            fallback_models=list(llm_cfg.fallback_models),
+            max_tokens=4096,
+            temperature=0.7,
+            max_retries=3,
+            timeout_sec=300,
+        ))
 
     def chat(
         self,
         messages: list[dict[str, str]],
         *,
-        model: str | None = None,
+        system: str = "",
+        json_mode: bool = False,
         max_tokens: int | None = None,
         temperature: float | None = None,
-        json_mode: bool = False,
-        system: str | None = None,
         strip_thinking: bool = False,
     ) -> LLMResponse:
-        """Send a chat completion request with retry and fallback.
+        """Send a chat completion request with model fallback.
 
-        Args:
-            messages: List of {role, content} dicts.
-            model: Override model (skips fallback chain).
-            max_tokens: Override max token count.
-            temperature: Override temperature.
-            json_mode: Request JSON response format.
-            system: Prepend a system message.
-            strip_thinking: If True, strip <think>…</think> reasoning
-                tags from the response content.  Use this when the
-                output will be written to paper/script artifacts but
-                NOT for general chat calls (to avoid corrupting
-                legitimate content).
-
-        Returns:
-            LLMResponse with content and metadata.
+        Parameters
+        ----------
+        messages:
+            List of message dicts with 'role' and 'content'.
+        system:
+            Optional system prompt (prepended to messages).
+        json_mode:
+            Request JSON response format.
+        max_tokens:
+            Override configured max_tokens.
+        temperature:
+            Override configured temperature.
+        strip_thinking:
+            If True, strip <think>…</think> reasoning blocks from the response.
         """
+        _messages = list(messages)
         if system:
-            messages = [{"role": "system", "content": system}] + messages
+            _messages.insert(0, {"role": "system", "content": system})
 
-        models = [model] if model else self._model_chain
-        max_tok = max_tokens or self.config.max_tokens
         temp = temperature if temperature is not None else self.config.temperature
+        max_tok = max_tokens if max_tokens is not None else self.config.max_tokens
 
-        last_error: Exception | None = None
-
-        for m in models:
+        last_exc = None
+        for model in self._model_chain:
             try:
                 resp = self._call_with_retry(m, messages, max_tok, temp, json_mode)
                 if strip_thinking:
                     from researchclaw.utils.thinking_tags import strip_thinking_tags
 
-                    resp = LLMResponse(
+                    return LLMResponse(
                         content=strip_thinking_tags(resp.content),
                         model=resp.model,
                         prompt_tokens=resp.prompt_tokens,
@@ -231,56 +206,12 @@ class LLMClient:
                         raw=resp.raw,
                     )
                 return resp
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Model %s failed: %s. Trying next.", m, exc)
-                last_error = exc
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"Model {model} failed: {exc}. Trying next.")
+                continue
 
-        raise RuntimeError(
-            f"All models failed. Last error: {last_error}"
-        ) from last_error
-
-    def preflight(self) -> tuple[bool, str]:
-        """Quick connectivity check - one minimal chat call.
-
-        Returns (success, message).
-        Distinguishes: 401 (bad key), 403 (model forbidden),
-                       404 (bad endpoint), 429 (rate limited), timeout.
-        """
-        is_reasoning = any(
-            self.config.primary_model.startswith(p) for p in _NEW_PARAM_MODELS
-        )
-        min_tokens = 64 if is_reasoning else 1
-        try:
-            _ = self.chat(
-                [{"role": "user", "content": "ping"}],
-                max_tokens=min_tokens,
-                temperature=0,
-            )
-            return True, f"OK - model {self.config.primary_model} responding"
-        except urllib.error.HTTPError as e:
-            status_map = {
-                401: "Invalid API key",
-                403: f"Model {self.config.primary_model} not allowed for this key",
-                404: f"Endpoint not found: {self._endpoint_url(self.config.base_url)}",
-                429: "Rate limited - try again in a moment",
-            }
-            msg = status_map.get(e.code, f"HTTP {e.code}")
-            return False, msg
-        except (urllib.error.URLError, OSError) as e:
-            return False, f"Connection failed: {e}"
-        except RuntimeError as e:
-            # chat() wraps errors in RuntimeError; extract original HTTPError
-            cause = e.__cause__
-            if isinstance(cause, urllib.error.HTTPError):
-                status_map = {
-                    401: "Invalid API key",
-                    403: f"Model {self.config.primary_model} not allowed for this key",
-                    404: f"Endpoint not found: {self._endpoint_url(self.config.base_url)}",
-                    429: "Rate limited - try again in a moment",
-                }
-                msg = status_map.get(cause.code, f"HTTP {cause.code}")
-                return False, msg
-            return False, f"All models failed: {e}"
+        raise RuntimeError(f"All models failed. Last error: {last_exc}")
 
     def _call_with_retry(
         self,
@@ -290,98 +221,30 @@ class LLMClient:
         temperature: float,
         json_mode: bool,
     ) -> LLMResponse:
-        """Call with exponential backoff retry."""
-        for attempt in range(self.config.max_retries):
+        """Call API with exponential backoff retry, falling back through model chain."""
+        last_exc = None
+        for attempt in range(self.config.max_retries + 1):
             try:
-                return self._raw_call(
+                return self._single_call(
                     model, messages, max_tokens, temperature, json_mode
                 )
-            except urllib.error.HTTPError as e:
-                status = e.code
-                body = ""
-                try:
-                    body = e.read().decode()[:500]
-                except Exception:  # noqa: BLE001
-                    pass
-
-                # Non-retryable errors
-                if status == 403 and "not allowed to use model" in body:
-                    raise  # Model not available — let fallback handle
-
-                # 400 is normally non-retryable, but some providers
-                # (Azure OpenAI) return 400 during overload / rate-limit.
-                # Retry if the body hints at a transient issue.
-                if status == 400:
-                    _transient_400 = any(
-                        kw in body.lower()
-                        for kw in (
-                            "rate limit",
-                            "ratelimit",
-                            "overloaded",
-                            "temporarily",
-                            "capacity",
-                            "throttl",
-                            "too many",
-                            "retry",
-                        )
-                    )
-                    if not _transient_400:
-                        raise  # Genuine bad request — don't retry
-
-                # Retryable: 429 (rate limit), transient 400, 500, 502, 503, 504,
-                # 529 (Anthropic overloaded)
-                if status in (400, 429, 500, 502, 503, 504, 529):
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+                last_exc = exc
+                if attempt < self.config.max_retries:
                     delay = min(
-                        self.config.retry_base_delay * (2**attempt),
+                        self.config.retry_base_delay ** (attempt + 1),
                         _MAX_BACKOFF_SEC,
                     )
-                    # Add jitter
-                    import random
-
-                    delay += random.uniform(0, delay * 0.3)
-                    logger.info(
-                        "Retry %d/%d for %s (HTTP %d). Waiting %.1fs.",
-                        attempt + 1,
-                        self.config.max_retries,
-                        model,
-                        status,
-                        delay,
+                    logger.warning(
+                        f"API call failed (attempt {attempt + 1}/{self.config.max_retries + 1}): "
+                        f"{exc}. Retrying in {delay:.1f}s..."
                     )
                     time.sleep(delay)
-                    continue
+                else:
+                    raise
+        raise RuntimeError(f"All retries exhausted. Last error: {last_exc}")
 
-                raise  # Other HTTP errors
-            except urllib.error.URLError:
-                if attempt < self.config.max_retries - 1:
-                    delay = min(
-                        self.config.retry_base_delay * (2**attempt),
-                        _MAX_BACKOFF_SEC,
-                    )
-                    time.sleep(delay)
-                    continue
-                raise
-            except (TimeoutError, OSError) as exc:
-                # Covers TimeoutError, ConnectionResetError, IncompleteRead, etc.
-                if attempt < self.config.max_retries - 1:
-                    delay = self.config.retry_base_delay * (2**attempt)
-                    logger.info(
-                        "Retry %d/%d for %s (%s). Waiting %.1fs.",
-                        attempt + 1,
-                        self.config.max_retries,
-                        model,
-                        type(exc).__name__,
-                        delay,
-                    )
-                    time.sleep(delay)
-                    continue
-                raise
-
-        # All retries exhausted
-        raise RuntimeError(
-            f"LLM call failed after {self.config.max_retries} retries for model {model}"
-        )
-
-    def _raw_call(
+    def _single_call(
         self,
         model: str,
         messages: list[dict[str, str]],
@@ -419,7 +282,9 @@ class LLMClient:
                     body["temperature"] = _temp
 
                 # Use correct token parameter based on model
-                if any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS):
+                # DeepSeek v4-pro is a reasoning model and may need
+                # max_completion_tokens to properly control output length.
+                if any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS) or "v4-pro" in model:
                     reasoning_min = 32768
                     body["max_completion_tokens"] = max(max_tokens, reasoning_min)
                 else:
@@ -554,12 +419,7 @@ class LLMClient:
         for message in messages:
             role = str(message.get("role", "user") or "user")
             content = str(message.get("content", "") or "")
-            items.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": content}],
-                }
-            )
+            items.append({"role": role, "content": content})
         return items
 
     def _parse_chat_completions_response(
@@ -573,15 +433,35 @@ class LLMClient:
 
         message = choice.get("message", {})
         content = message.get("content") or ""
-        # DeepSeek v4 Pro (and other reasoning models) may return empty
-        # content when all output tokens are consumed by chain-of-thought.
-        # Fall back to reasoning_content in that case.
+        # DeepSeek v4 Pro may return empty content when reasoning consumes
+        # all output tokens. Try to salvage JSON from reasoning_content.
         if not content:
             reasoning = message.get("reasoning_content") or ""
             if reasoning:
-                # The JSON response is usually at the end of the reasoning.
-                # Try to extract it by looking for the last JSON object.
-                content = reasoning
+                # Look for JSON object/array in the reasoning tail
+                import re as _re
+                _json_candidates = _re.findall(r'\{[^{}]*\{[^}]*\}[^{}]*\}|\[[^\[\]]*\[[^\]]*\][^\[\]]*\]|\{[^}]*\}|\[[^\]]*\]', reasoning)
+                for _c in reversed(_json_candidates):
+                    try:
+                        json.loads(_c)
+                        content = _c
+                        break
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                if not content:
+                    # Last resort: try balanced-brace extraction from the tail
+                    _brace_depth = 0
+                    _start = -1
+                    for _i in range(len(reasoning) - 1, -1, -1):
+                        if reasoning[_i] == '}':
+                            if _brace_depth == 0:
+                                _end = _i
+                            _brace_depth += 1
+                        elif reasoning[_i] == '{':
+                            _brace_depth -= 1
+                            if _brace_depth == 0:
+                                content = reasoning[_i:_end + 1]
+                                break
 
         return LLMResponse(
             content=content,
@@ -631,63 +511,17 @@ class LLMClient:
         incomplete_details = data.get("incomplete_details")
         if isinstance(incomplete_details, dict):
             reason = incomplete_details.get("reason")
-            if isinstance(reason, str) and reason:
-                finish_reason = reason
-                truncated = reason in ("max_output_tokens", "content_filter")
-
-        usage = data.get("usage", {})
-        prompt_tokens = 0
-        completion_tokens = 0
-        total_tokens = 0
-        if isinstance(usage, dict):
-            prompt_tokens = int(usage.get("input_tokens", 0) or 0)
-            completion_tokens = int(usage.get("output_tokens", 0) or 0)
-            total_tokens = int(
-                usage.get("total_tokens", prompt_tokens + completion_tokens) or 0
-            )
+            if reason == "max_output_tokens":
+                truncated = True
+                finish_reason = "length"
 
         return LLMResponse(
             content="".join(chunks),
-            model=data.get("model", model),
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
+            model=model,
+            total_tokens=data.get("usage", {}).get("total_tokens", 0),
+            prompt_tokens=data.get("usage", {}).get("input_tokens", 0),
+            completion_tokens=data.get("usage", {}).get("output_tokens", 0),
             finish_reason=finish_reason,
             truncated=truncated,
             raw=data,
         )
-
-
-def create_client_from_yaml(yaml_path: str | None = None) -> LLMClient:
-    """Create an LLMClient from the ARC config file.
-
-    Reads base_url and api_key from config.arc.yaml's llm section.
-    """
-    import yaml as _yaml
-
-    if yaml_path is None:
-        yaml_path = "config.yaml"
-
-    with open(yaml_path, encoding="utf-8") as f:
-        raw = _yaml.safe_load(f)
-
-    llm_section = raw.get("llm", {})
-    api_key = str(
-        os.environ.get(
-            llm_section.get("api_key_env", "OPENAI_API_KEY"),
-            llm_section.get("api_key", ""),
-        )
-        or ""
-    )
-
-    return LLMClient(
-        LLMConfig(
-            base_url=llm_section.get("base_url", "https://api.openai.com/v1"),
-            api_key=api_key,
-            wire_api=llm_section.get("wire_api", "chat_completions"),
-            primary_model=llm_section.get("primary_model", "gpt-4o"),
-            fallback_models=llm_section.get(
-                "fallback_models", ["gpt-4.1", "gpt-4o-mini"]
-            ),
-        )
-    )
