@@ -224,8 +224,8 @@ def search_papers(
     if deduplicate:
         all_papers = _deduplicate(all_papers)
 
-    # Sort by citation count descending, then year descending
-    all_papers.sort(key=lambda p: (p.citation_count, p.year), reverse=True)
+    # Rerank by relevance (keyword match) first, citation count second
+    all_papers = _rerank_by_relevance(all_papers, [query])
 
     return all_papers
 
@@ -260,8 +260,9 @@ def search_papers_multi_query(
         logger.info("Query %d/%d %r → %d papers", i + 1, len(queries), q, len(results))
 
     deduped = _deduplicate(all_papers)
-    deduped.sort(key=lambda p: (p.citation_count, p.year), reverse=True)
-    return deduped
+    # Rerank by relevance across all queries
+    reranked = _rerank_by_relevance(deduped, queries)
+    return reranked
 
 
 # ------------------------------------------------------------------
@@ -356,6 +357,55 @@ def _deduplicate(papers: list[Paper]) -> list[Paper]:
         result.append(paper)
 
     return result
+
+
+def _rerank_by_relevance(
+    papers: list[Paper],
+    queries: list[str],
+) -> list[Paper]:
+    """Rerank papers by keyword relevance to the search queries.
+
+    Composite score (higher = more relevant):
+      - Primary: count of query keywords found in title + abstract (×10)
+      - Secondary: log(citation_count + 1) as quality signal
+      - Tertiary: year recency bonus (0–2 points)
+
+    A paper about the topic with 10 citations ranks above an unrelated
+    paper with 10,000 citations.
+    """
+    if not queries:
+        papers.sort(key=lambda p: (p.citation_count, p.year), reverse=True)
+        return papers
+
+    # Build a set of meaningful keywords from all queries
+    _stop = {
+        "a", "an", "the", "of", "for", "in", "on", "and", "or", "with",
+        "to", "by", "from", "its", "is", "are", "was", "be", "as", "at",
+        "via", "using", "based", "study", "analysis", "empirical",
+        "towards", "toward", "into", "exploring", "comparison", "tasks",
+        "effectiveness", "investigation", "comprehensive", "novel",
+        "challenge", "challenges", "gaps", "gap", "critical", "survey", "review",
+    }
+    query_keywords: set[str] = set()
+    for q in queries:
+        for w in re.split(r"[^a-zA-Z0-9]+", q.lower()):
+            if len(w) >= 3 and w not in _stop:
+                query_keywords.add(w)
+
+    import math
+
+    def _score(paper: Paper) -> float:
+        text = f"{paper.title} {paper.abstract}".lower()
+        # Count unique keyword matches
+        kw_hits = sum(1 for kw in query_keywords if kw in text)
+        # log citation count (0 if no citation data)
+        cit_score = math.log(paper.citation_count + 1)
+        # Year recency: 2020=0, 2021=1, ..., 2026=2 (capped)
+        year_bonus = max(0, min(2, (paper.year - 2020) * 0.33))
+        return kw_hits * 10.0 + cit_score + year_bonus
+
+    papers.sort(key=_score, reverse=True)
+    return papers
 
 
 def papers_to_bibtex(papers: Sequence[Paper]) -> str:
