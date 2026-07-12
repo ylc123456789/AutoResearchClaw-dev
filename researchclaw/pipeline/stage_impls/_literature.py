@@ -710,20 +710,96 @@ def _execute_literature_screen(
         # Strip authors list — not needed for screening and inflates tokens
         row.pop("authors", None)
 
-    # Rebuild candidates_text from filtered rows
+    # --- P1-2: Stratified sampling for diverse LLM screening ---
+    # Instead of truncating the first N chars (which are dominated by
+    # high-citation but often irrelevant papers), sample from 4 strata
+    # so the LLM sees a representative cross-section of the candidate pool.
+    _TARGET_CHARS = _MAX_CANDIDATES_CHARS
+    _STRATA = [
+        ("keyword_match", lambda r: r.get("keyword_overlap", 0), True),
+        ("high_citation", lambda r: r.get("citation_count", 0), True),
+        ("recent", lambda r: r.get("year", 0), True),
+        ("random_tail", lambda r: 0, False),  # random sampling
+    ]
+    _STRATA_BUDGETS = [0.30, 0.25, 0.20, 0.25]  # fraction of total chars per stratum
+
+    import random as _random
+    _random.seed(42)  # deterministic across runs
+
+    # Sort a copy of filtered_rows by each criterion
+    keyword_sorted = sorted(filtered_rows, key=lambda r: r.get("keyword_overlap", 0), reverse=True)
+    citation_sorted = sorted(filtered_rows, key=lambda r: r.get("citation_count", 0), reverse=True)
+    year_sorted = sorted(filtered_rows, key=lambda r: r.get("year", 0) or 0, reverse=True)
+
+    _seen_ids: set[str] = set()
+    sampled_rows: list[dict[str, Any]] = []
+
+    def _add_candidate(row: dict[str, Any], budget_remaining: int) -> int:
+        """Add a candidate to the sample if not already selected. Returns chars consumed."""
+        pid = str(row.get("paper_id", row.get("title", "")))
+        if pid in _seen_ids:
+            return 0
+        _seen_ids.add(pid)
+        line = json.dumps(row, ensure_ascii=False)
+        sampled_rows.append(row)
+        return len(line) + 1  # +1 for newline
+
+    # Stratum 1: Top keyword matches (30% budget)
+    _budget = int(_TARGET_CHARS * _STRATA_BUDGETS[0])
+    _used = 0
+    for r in keyword_sorted:
+        if _used >= _budget:
+            break
+        _used += _add_candidate(r, _budget - _used)
+    logger.info("Stratum keyword_match: %d papers, %d chars", len(sampled_rows), _used)
+
+    # Stratum 2: High citation (25% budget) — skip papers already in keyword stratum
+    _budget = int(_TARGET_CHARS * _STRATA_BUDGETS[1])
+    _used = 0
+    _before = len(sampled_rows)
+    for r in citation_sorted:
+        if _used >= _budget:
+            break
+        _used += _add_candidate(r, _budget - _used)
+    logger.info("Stratum high_citation: %d new papers, %d chars",
+                len(sampled_rows) - _before, _used)
+
+    # Stratum 3: Recent papers (20% budget)
+    _budget = int(_TARGET_CHARS * _STRATA_BUDGETS[2])
+    _used = 0
+    _before = len(sampled_rows)
+    _current_year = int(str(_utcnow_iso())[:4])
+    for r in year_sorted:
+        if _used >= _budget:
+            break
+        yr = r.get("year", 0) or 0
+        if yr < _current_year - 2:
+            continue  # only recent papers in this stratum
+        _used += _add_candidate(r, _budget - _used)
+    logger.info("Stratum recent: %d new papers, %d chars",
+                len(sampled_rows) - _before, _used)
+
+    # Stratum 4: Random tail (25% budget) — catch what other strata missed
+    _budget = int(_TARGET_CHARS * _STRATA_BUDGETS[3])
+    _used = 0
+    _before = len(sampled_rows)
+    _remaining = [r for r in filtered_rows if str(r.get("paper_id", r.get("title", ""))) not in _seen_ids]
+    _random.shuffle(_remaining)
+    for r in _remaining:
+        if _used >= _budget:
+            break
+        _used += _add_candidate(r, _budget - _used)
+    logger.info("Stratum random_tail: %d new papers, %d chars",
+                len(sampled_rows) - _before, _used)
+
+    # Rebuild candidates_text from sampled rows
     candidates_text = "\n".join(
-        json.dumps(r, ensure_ascii=False) for r in filtered_rows
+        json.dumps(r, ensure_ascii=False) for r in sampled_rows
     )
-    # Cap total candidates text size to avoid blowing token budget
-    if len(candidates_text) > _MAX_CANDIDATES_CHARS:
-        # Truncate at newline boundary to avoid cutting mid-JSON-line
-        candidates_text = candidates_text[:_MAX_CANDIDATES_CHARS].rsplit("\n", 1)[0]
-        logger.info(
-            "Candidates text truncated to %d chars for screening",
-            len(candidates_text),
-        )
     logger.info(
-        "Domain pre-filter: kept %d, dropped %d (keywords: %s)",
+        "Stratified sampling: %d papers (%d chars) from %d filtered (%d dropped by keyword pre-filter, keywords: %s)",
+        len(sampled_rows),
+        len(candidates_text),
         len(filtered_rows),
         dropped_count,
         topic_keywords[:8],
