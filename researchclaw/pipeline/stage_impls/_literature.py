@@ -107,6 +107,16 @@ def _execute_search_strategy(
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
         )
+        # Debug: save raw LLM response for diagnosing parse failures
+        _raw_path = stage_dir / "_llm_response_debug.txt"
+        _raw_path.write_text(
+            f"--- RAW LLM RESPONSE (len={len(resp.content)}) ---\n"
+            f"finish_reason: {resp.finish_reason}\n"
+            f"truncated: {resp.truncated}\n"
+            f"total_tokens: {resp.total_tokens}\n"
+            f"--- CONTENT ---\n{resp.content[:5000]}",
+            encoding="utf-8",
+        )
         payload = _safe_json_loads(resp.content, {})
         if isinstance(payload, dict):
             # --- Format A: new pure-JSON search_plan (preferred) ---
