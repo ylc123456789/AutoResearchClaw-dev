@@ -171,25 +171,34 @@ stages:
       {plan_text}'
   literature_screen:
     json_mode: true
-    system: You are a strict domain-aware reviewer. Reject off-topic papers aggressively.
-    user: 'Perform merged relevance+quality screening and return shortlist.
+    max_tokens: 16384
+    system: You are a strict domain-aware reviewer. Score each candidate paper on relevance (0-1) and quality (0-1), then return
+      only the papers that pass the threshold. Reject off-topic papers aggressively — a paper about a different domain is
+      worthless regardless of citation count.
+    user: |-
+      Screen these candidate papers for relevance to the research topic.
 
-      Return JSON: {shortlist:[...]} each with title, cite_key (if present), relevance_score (0-1), quality_score (0-1), keep_reason.
+      TOPIC: {topic}
+      DOMAINS: {domains}
+      THRESHOLD: {quality_threshold}
 
-      Preserve all original fields (paper_id, doi, arxiv_id, cite_key, etc.) from the input.
+      For each paper, evaluate:
+      - relevance_score (0-1): how closely does this paper relate to the topic?
+      - quality_score (0-1): is this a well-conducted study from a reputable venue?
+      - keep_reason: one sentence explaining why this paper is relevant (or why not)
 
-      Topic: {topic}
+      ONLY keep papers with relevance_score >= 0.5 AND quality_score >= 0.4.
+      Reject papers about completely unrelated domains (biology, physics, materials science, etc.)
+      even if they are highly cited.
 
-      Domains: {domains}
+      Return a JSON object with a "shortlist" array. Preserve these original fields
+      from each candidate: paper_id, title, cite_key, year, abstract, venue, citation_count,
+      doi, arxiv_id, url, source. Do NOT include the full authors list.
 
-      Threshold: {quality_threshold}
+      Return ONLY valid JSON — no markdown fences, no extra text.
 
-      IMPORTANT: Only keep papers genuinely relevant to the topic above. Reject papers about unrelated domains even if they
-      are high quality.
-
-      Candidates JSONL:
-
-      {candidates_text}'
+      Candidates:
+      {candidates_text}
   paper_draft:
     max_tokens: 32768
     system: "You are a top-tier ML paper author writing for NeurIPS/ICML/ICLR.\n\n\
