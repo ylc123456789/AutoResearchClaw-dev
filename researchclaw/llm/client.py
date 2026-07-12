@@ -573,6 +573,15 @@ class LLMClient:
 
         message = choice.get("message", {})
         content = message.get("content") or ""
+        # DeepSeek v4 Pro (and other reasoning models) may return empty
+        # content when all output tokens are consumed by chain-of-thought.
+        # Fall back to reasoning_content in that case.
+        if not content:
+            reasoning = message.get("reasoning_content") or ""
+            if reasoning:
+                # The JSON response is usually at the end of the reasoning.
+                # Try to extract it by looking for the last JSON object.
+                content = reasoning
 
         return LLMResponse(
             content=content,
